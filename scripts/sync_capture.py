@@ -11,6 +11,7 @@ import threading
 import queue
 import signal
 import logging
+import time
 
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -111,47 +112,46 @@ class FrameConsumer(threading.Thread):
 
     def process_frame(self, frame_data):
         camera_type, frame = frame_data
+        timestamp = datetime.now()
         if camera_type == "boson":
-            self.save_frame(frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), self.frame_number)
+            self.save_frame(frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
             boson_agc_rgb = self.boson_camera.get_agc_frame(frame)
-            self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), self.frame_number)
+            self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
+            self.save_meta(self.calculate_meta(frame), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
+            self.save_meta(self.calculate_meta(boson_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
         elif camera_type == "blackfly":
-            self.save_frame(frame, os.path.join(self.scene_dir, "rgb", "data"), self.frame_number)
+            self.save_frame(frame, os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
+            self.save_meta(self.calculate_meta(frame), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
 
-        meta = self.calculate_meta(self.frame_number, frame)
-        self.save_meta(meta, os.path.join(self.scene_dir, "meta"), self.frame_number)
-
-    @staticmethod
-    def save_frame(frame, directory, frame_number):
+    def save_frame(self, frame, directory, prefix, timestamp):
         os.makedirs(directory, exist_ok=True)
-        filename = os.path.join(directory, f"frame_{frame_number:06d}.png")
-        cv2.imwrite(filename, frame)
+        filename = f"{prefix}_{self.frame_number:06d}_{timestamp.strftime('%H_%M_%S_%f')[:-3]}.png"
+        cv2.imwrite(os.path.join(directory, filename), frame)
 
-    @staticmethod
-    def save_meta(meta, directory, frame_number):
+    def save_meta(self, meta, directory, timestamp):
         os.makedirs(directory, exist_ok=True)
-        filename = os.path.join(directory, f"meta_{frame_number:06d}.json")
-        with open(filename, 'w') as f:
+        filename = f"meta_{self.frame_number:06d}_{timestamp.strftime('%H_%M_%S_%f')[:-3]}.json"
+        with open(os.path.join(directory, filename), 'w') as f:
             json.dump(meta, f)
 
-    @staticmethod
-    def calculate_meta(frame_number, frame):
+    def calculate_meta(self, frame):
         return {
             "timestamp": datetime.now().isoformat(),
-            "frame_number": frame_number,
+            "frame_number": self.frame_number,
             "min": int(np.min(frame)),
             "max": int(np.max(frame)),
             "mean": float(np.mean(frame))
         }
 
 class SceneRecorder:
-    def __init__(self, base_dir):
+    def __init__(self, base_dir, recording_duration=10):
         self.base_dir = base_dir
         self.boson_camera = BosonCamera()
         self.blackfly_camera = BlackflyCamera()
         self.scene_number = self.get_next_scene_number()
         self.frame_queue = queue.Queue(maxsize=100)
         self.stop_event = threading.Event()
+        self.recording_duration = recording_duration
 
     def signal_handler(self, signum, frame):
         logging.info('Received termination signal. Exiting...')
@@ -180,8 +180,9 @@ class SceneRecorder:
         return scene_dir
 
     def record_scene(self):
+        self.stop_event.clear()  # Clear the stop event before starting a new recording
         scene_dir = self.create_directory_structure()
-        logging.info(f"Recording scene {self.scene_number}. Press 'q' to stop recording.")
+        logging.info(f"Recording scene {self.scene_number}. Press 'q' and Enter to stop recording.")
 
         boson_producer = FrameProducer(self.boson_camera, self.frame_queue, self.stop_event, "boson")
         blackfly_producer = FrameProducer(self.blackfly_camera, self.frame_queue, self.stop_event, "blackfly")
@@ -191,9 +192,14 @@ class SceneRecorder:
         blackfly_producer.start()
         consumer.start()
 
+        start_time = time.time()
+
         try:
             while not self.stop_event.is_set():
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if time.time() - start_time > self.recording_duration:
+                    logging.info(f"Recording duration of {self.recording_duration} seconds reached.")
+                    break
+                if input().lower() == 'q':
                     logging.info("User requested stop.")
                     break
         except KeyboardInterrupt:
@@ -212,9 +218,7 @@ class SceneRecorder:
         try:
             while True:
                 self.record_scene()
-                if self.stop_event.is_set():
-                    break
-                user_input = input("Press 'q' to quit or any other key to record another scene: ")
+                user_input = input("Press Enter to record another scene or 'q' to quit: ")
                 if user_input.lower() == 'q':
                     break
         finally:
@@ -228,13 +232,15 @@ class SceneRecorder:
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Scene Recorder for Boson and Blackfly cameras")
     parser.add_argument("--base_dir", type=str, default="UCRT", help="Base directory for saving scenes")
+    parser.add_argument("--duration", type=int, default=10, help="Recording duration for each scene in seconds")
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
     base_dir = args.base_dir
+    recording_duration = args.duration
     os.makedirs(base_dir, exist_ok=True)
-    recorder = SceneRecorder(base_dir)
+    recorder = SceneRecorder(base_dir, recording_duration)
     recorder.record_scenes()
 
 if __name__ == "__main__":
