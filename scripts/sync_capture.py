@@ -7,6 +7,13 @@ from abc import ABC, abstractmethod
 from flirpy.camera.boson import Boson
 import PySpin
 import argparse
+import threading
+import queue
+import signal
+import logging
+
+# Set up basic logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Camera(ABC):
     @abstractmethod
@@ -24,7 +31,7 @@ class BosonCamera(Camera):
     def capture_frame(self):
         frame = self.camera.grab()
         if frame is None:
-            print("Failed to capture Boson frame")
+            logging.warning("Failed to capture Boson frame")
             return None
         return frame
 
@@ -48,7 +55,7 @@ class BlackflyCamera(Camera):
     def capture_frame(self):
         image_result = self.camera.GetNextImage()
         if image_result.IsIncomplete():
-            print(f"Blackfly image incomplete with image status {image_result.GetImageStatus()}")
+            logging.warning(f"Blackfly image incomplete with image status {image_result.GetImageStatus()}")
             image_result.Release()
             return None
         frame = image_result.GetNDArray()
@@ -62,12 +69,93 @@ class BlackflyCamera(Camera):
         self.cam_list.Clear()
         self.system.ReleaseInstance()
 
+class FrameProducer(threading.Thread):
+    def __init__(self, camera, frame_queue, stop_event, camera_type):
+        super().__init__()
+        self.camera = camera
+        self.frame_queue = frame_queue
+        self.stop_event = stop_event
+        self.camera_type = camera_type
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                frame = self.camera.capture_frame()
+                if frame is not None:
+                    self.frame_queue.put((self.camera_type, frame))
+        except Exception as e:
+            logging.error(f"FrameProducer encountered an error: {e}")
+            self.stop_event.set()  # Signal the consumer to stop
+
+class FrameConsumer(threading.Thread):
+    def __init__(self, frame_queue, scene_dir, stop_event, boson_camera):
+        super().__init__()
+        self.frame_queue = frame_queue
+        self.scene_dir = scene_dir
+        self.stop_event = stop_event
+        self.frame_number = 0
+        self.boson_camera = boson_camera
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set() or not self.frame_queue.empty():
+                try:
+                    frame_data = self.frame_queue.get(timeout=1)
+                    self.process_frame(frame_data)
+                    self.frame_number += 1
+                except queue.Empty:
+                    continue
+        except Exception as e:
+            logging.error(f"FrameConsumer encountered an error: {e}")
+            self.stop_event.set()  # Signal to stop
+
+    def process_frame(self, frame_data):
+        camera_type, frame = frame_data
+        if camera_type == "boson":
+            self.save_frame(frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), self.frame_number)
+            boson_agc_rgb = self.boson_camera.get_agc_frame(frame)
+            self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), self.frame_number)
+        elif camera_type == "blackfly":
+            self.save_frame(frame, os.path.join(self.scene_dir, "rgb", "data"), self.frame_number)
+
+        meta = self.calculate_meta(self.frame_number, frame)
+        self.save_meta(meta, os.path.join(self.scene_dir, "meta"), self.frame_number)
+
+    @staticmethod
+    def save_frame(frame, directory, frame_number):
+        os.makedirs(directory, exist_ok=True)
+        filename = os.path.join(directory, f"frame_{frame_number:06d}.png")
+        cv2.imwrite(filename, frame)
+
+    @staticmethod
+    def save_meta(meta, directory, frame_number):
+        os.makedirs(directory, exist_ok=True)
+        filename = os.path.join(directory, f"meta_{frame_number:06d}.json")
+        with open(filename, 'w') as f:
+            json.dump(meta, f)
+
+    @staticmethod
+    def calculate_meta(frame_number, frame):
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "frame_number": frame_number,
+            "min": int(np.min(frame)),
+            "max": int(np.max(frame)),
+            "mean": float(np.mean(frame))
+        }
+
 class SceneRecorder:
     def __init__(self, base_dir):
         self.base_dir = base_dir
         self.boson_camera = BosonCamera()
         self.blackfly_camera = BlackflyCamera()
         self.scene_number = self.get_next_scene_number()
+        self.frame_queue = queue.Queue(maxsize=100)
+        self.stop_event = threading.Event()
+
+    def signal_handler(self, signum, frame):
+        logging.info('Received termination signal. Exiting...')
+        self.stop_event.set()  # Signal threads to stop
 
     def get_next_scene_number(self):
         scene_number = 1
@@ -91,79 +179,51 @@ class SceneRecorder:
             os.makedirs(directory, exist_ok=True)
         return scene_dir
 
-    @staticmethod
-    def save_frame(frame, directory, frame_number):
-        filename = os.path.join(directory, f"frame_{frame_number:06d}.png")
-        cv2.imwrite(filename, frame)
+    def record_scene(self):
+        scene_dir = self.create_directory_structure()
+        logging.info(f"Recording scene {self.scene_number}. Press 'q' to stop recording.")
 
-    @staticmethod
-    def save_meta(meta, directory, frame_number):
-        filename = os.path.join(directory, f"meta_{frame_number:06d}.json")
-        with open(filename, 'w') as f:
-            json.dump(meta, f)
+        boson_producer = FrameProducer(self.boson_camera, self.frame_queue, self.stop_event, "boson")
+        blackfly_producer = FrameProducer(self.blackfly_camera, self.frame_queue, self.stop_event, "blackfly")
+        consumer = FrameConsumer(self.frame_queue, scene_dir, self.stop_event, self.boson_camera)
 
-    def capture_scene(self, scene_dir, max_frames=1000):
-        frame_number = 0
-        while frame_number < max_frames:
-            boson_frame = self.boson_camera.capture_frame()
-            blackfly_frame = self.blackfly_camera.capture_frame()
+        boson_producer.start()
+        blackfly_producer.start()
+        consumer.start()
 
-            if boson_frame is None or blackfly_frame is None:
-                continue
+        try:
+            while not self.stop_event.is_set():
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logging.info("User requested stop.")
+                    break
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received.")
+        finally:
+            self.stop_event.set()
+            boson_producer.join()
+            blackfly_producer.join()
+            consumer.join()
 
-            self.save_frame(boson_frame, os.path.join(scene_dir, "lwir", "raw", "data"), frame_number)
-            
-            boson_agc_rgb = self.boson_camera.get_agc_frame(boson_frame)
-            self.save_frame(boson_agc_rgb, os.path.join(scene_dir, "lwir", "agc", "data"), frame_number)
-            
-            self.save_frame(blackfly_frame, os.path.join(scene_dir, "rgb", "data"), frame_number)
-            
-            meta = self.calculate_meta(frame_number, boson_frame, blackfly_frame)
-            self.save_meta(meta, os.path.join(scene_dir, "lwir", "raw", "meta"), frame_number)
-            self.save_meta(meta, os.path.join(scene_dir, "lwir", "agc", "meta"), frame_number)
-            self.save_meta(meta, os.path.join(scene_dir, "rgb", "meta"), frame_number)
-
-            print(f"Saved frame {frame_number}")
-            frame_number += 1
-
-            cv2.imshow('Boson', boson_agc_rgb)
-            cv2.imshow('Blackfly', blackfly_frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        return frame_number
-
-    @staticmethod
-    def calculate_meta(frame_number, boson_frame, blackfly_frame):
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "frame_number": frame_number,
-            "boson_min": int(np.min(boson_frame)),
-            "boson_max": int(np.max(boson_frame)),
-            "boson_mean": float(np.mean(boson_frame)),
-            "blackfly_mean": float(np.mean(blackfly_frame))
-        }
+        logging.info(f"Scene {self.scene_number} completed. {consumer.frame_number} frames captured.")
+        self.scene_number = self.get_next_scene_number()
 
     def record_scenes(self):
+        signal.signal(signal.SIGINT, self.signal_handler)  # Handle Ctrl+C
         try:
             while True:
-                scene_dir = self.create_directory_structure()
-                print(f"Recording scene {self.scene_number}. Press 'q' to stop recording.")
-                frames_captured = self.capture_scene(scene_dir)
-                print(f"Scene {self.scene_number} completed. {frames_captured} frames captured.")
-
+                self.record_scene()
+                if self.stop_event.is_set():
+                    break
                 user_input = input("Press 'q' to quit or any other key to record another scene: ")
                 if user_input.lower() == 'q':
                     break
-                self.scene_number = self.get_next_scene_number()
         finally:
             self.close_cameras()
 
     def close_cameras(self):
+        logging.info("Closing cameras and cleaning up resources.")
         self.boson_camera.close()
         self.blackfly_camera.close()
-        cv2.destroyAllWindows()
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Scene Recorder for Boson and Blackfly cameras")
