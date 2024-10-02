@@ -41,6 +41,8 @@ class BlackflyCamera(Camera):
         self.cam_list = self.system.GetCameras()
         self.camera = self.cam_list[0]
         self.camera.Init()
+        self.camera.PixelFormat.SetValue(PySpin.PixelFormat_BGR8)
+        self.camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
         self.camera.BeginAcquisition()
 
     def capture_frame(self):
