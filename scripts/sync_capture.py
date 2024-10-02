@@ -96,32 +96,37 @@ class FrameConsumer(threading.Thread):
         self.stop_event = stop_event
         self.frame_number = 0
         self.boson_camera = boson_camera
+        self.buffer = {'boson': None, 'blackfly': None}
 
     def run(self):
         try:
             while not self.stop_event.is_set() or not self.frame_queue.empty():
                 try:
-                    frame_data = self.frame_queue.get(timeout=1)
-                    self.process_frame(frame_data)
-                    self.frame_number += 1
+                    camera_type, frame = self.frame_queue.get(timeout=1)
+                    self.buffer[camera_type] = frame
+                    if self.buffer['boson'] is not None and self.buffer['blackfly'] is not None:
+                        self.process_frame_pair()
+                        self.buffer = {'boson': None, 'blackfly': None}
+                        self.frame_number += 1
                 except queue.Empty:
                     continue
         except Exception as e:
             logging.error(f"FrameConsumer encountered an error: {e}")
             self.stop_event.set()  # Signal to stop
 
-    def process_frame(self, frame_data):
-        camera_type, frame = frame_data
+    def process_frame_pair(self):
         timestamp = datetime.now()
-        if camera_type == "boson":
-            self.save_frame(frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
-            boson_agc_rgb = self.boson_camera.get_agc_frame(frame)
-            self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
-            self.save_meta(self.calculate_meta(frame), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
-            self.save_meta(self.calculate_meta(boson_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
-        elif camera_type == "blackfly":
-            self.save_frame(frame, os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
-            self.save_meta(self.calculate_meta(frame), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
+        
+        # Process Boson frame
+        self.save_frame(self.buffer['boson'], os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
+        boson_agc_rgb = self.boson_camera.get_agc_frame(self.buffer['boson'])
+        self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
+        self.save_meta(self.calculate_meta(self.buffer['boson']), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
+        self.save_meta(self.calculate_meta(boson_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
+
+        # Process Blackfly frame
+        self.save_frame(self.buffer['blackfly'], os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
+        self.save_meta(self.calculate_meta(self.buffer['blackfly']), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
 
     def save_frame(self, frame, directory, prefix, timestamp):
         os.makedirs(directory, exist_ok=True)
@@ -141,7 +146,7 @@ class FrameConsumer(threading.Thread):
             "min": int(np.min(frame)),
             "max": int(np.max(frame)),
             "mean": float(np.mean(frame))
-        }
+        }   
 
 class SceneRecorder:
     def __init__(self, base_dir, recording_duration=10):
