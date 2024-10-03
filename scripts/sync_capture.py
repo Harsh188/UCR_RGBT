@@ -51,7 +51,18 @@ class BlackflyCamera(Camera):
         self.camera.Init()
         self.camera.PixelFormat.SetValue(PySpin.PixelFormat_BGR8)
         self.camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
+        self.set_optimal_frame_rate()
         self.camera.BeginAcquisition()
+
+    def set_optimal_frame_rate(self):
+        try:
+            max_frame_rate = self.camera.AcquisitionFrameRate.GetMax()
+            self.camera.AcquisitionFrameRateEnable.SetValue(True)
+            self.camera.AcquisitionFrameRate.SetValue(max_frame_rate)
+            logging.info(f"Frame rate set to {max_frame_rate:.2f} fps")
+        except PySpin.SpinnakerException as e:
+            logging.warning(f"Unable to set frame rate: {e}")
+            logging.info("Continuing with default frame rate")
 
     def capture_frame(self):
         image_result = self.camera.GetNextImage()
@@ -79,19 +90,32 @@ class FrameProducer(threading.Thread):
         self.camera_type = camera_type
 
     def run(self):
+        frames_processed = 0
+        start_time = time.time()
+        last_log_time = start_time
         try:
             while not self.stop_event.is_set():
                 frame = self.camera.capture_frame()
                 if frame is not None:
-                    self.frame_queue.put((self.camera_type, frame))
+                    self.frame_queue.put(frame)
+                    frames_processed += 1
+                    current_time = time.time()
+                    if current_time - last_log_time >= 5:  # Log every 5 seconds
+                        elapsed_time = current_time - last_log_time
+                        fps = frames_processed / elapsed_time
+                        logging.info(f"{self.camera_type} frame rate: {fps:.2f} FPS")
+                        logging.info(f"{self.camera_type} queue size: {self.frame_queue.qsize()}")
+                        last_log_time = current_time
+                        frames_processed = 0
         except Exception as e:
-            logging.error(f"FrameProducer encountered an error: {e}")
+            logging.error(f"FrameProducer encountered an error: {e}", exc_info=True)
             self.stop_event.set()  # Signal the consumer to stop
 
 class FrameConsumer(threading.Thread):
-    def __init__(self, frame_queue, scene_dir, stop_event, boson_camera):
+    def __init__(self, boson_queue, blackfly_queue, scene_dir, stop_event, boson_camera):
         super().__init__()
-        self.frame_queue = frame_queue
+        self.boson_queue = boson_queue
+        self.blackfly_queue = blackfly_queue
         self.scene_dir = scene_dir
         self.stop_event = stop_event
         self.frame_number = 0
@@ -100,10 +124,13 @@ class FrameConsumer(threading.Thread):
 
     def run(self):
         try:
-            while not self.stop_event.is_set() or not self.frame_queue.empty():
+            while not self.stop_event.is_set() or not self.boson_queue.empty() or not self.blackfly_queue.empty():
                 try:
-                    camera_type, frame = self.frame_queue.get(timeout=1)
-                    self.buffer[camera_type] = frame
+                    if self.buffer['boson'] is None:
+                        self.buffer['boson'] = self.boson_queue.get(timeout=0.1)
+                    if self.buffer['blackfly'] is None:
+                        self.buffer['blackfly'] = self.blackfly_queue.get(timeout=0.1)
+                    
                     if self.buffer['boson'] is not None and self.buffer['blackfly'] is not None:
                         self.process_frame_pair()
                         self.buffer = {'boson': None, 'blackfly': None}
@@ -111,19 +138,17 @@ class FrameConsumer(threading.Thread):
                 except queue.Empty:
                     continue
         except Exception as e:
-            logging.error(f"FrameConsumer encountered an error: {e}")
+            logging.error(f"FrameConsumer encountered an error: {e}", exc_info=True)
             self.stop_event.set()  # Signal to stop
 
     def process_frame_pair(self):
         timestamp = datetime.now()
-        
         # Process Boson frame
         self.save_frame(self.buffer['boson'], os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
         boson_agc_rgb = self.boson_camera.get_agc_frame(self.buffer['boson'])
         self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
         self.save_meta(self.calculate_meta(self.buffer['boson']), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
         self.save_meta(self.calculate_meta(boson_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
-
         # Process Blackfly frame
         self.save_frame(self.buffer['blackfly'], os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
         self.save_meta(self.calculate_meta(self.buffer['blackfly']), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
@@ -146,7 +171,7 @@ class FrameConsumer(threading.Thread):
             "min": int(np.min(frame)),
             "max": int(np.max(frame)),
             "mean": float(np.mean(frame))
-        }   
+        }
 
 class SceneRecorder:
     def __init__(self, base_dir, recording_duration=10):
@@ -154,7 +179,8 @@ class SceneRecorder:
         self.boson_camera = BosonCamera()
         self.blackfly_camera = BlackflyCamera()
         self.scene_number = self.get_next_scene_number()
-        self.frame_queue = queue.Queue(maxsize=100)
+        self.boson_queue = queue.Queue(maxsize=1000)
+        self.blackfly_queue = queue.Queue(maxsize=1000)
         self.stop_event = threading.Event()
         self.recording_duration = recording_duration
 
@@ -189,16 +215,15 @@ class SceneRecorder:
         scene_dir = self.create_directory_structure()
         logging.info(f"Recording scene {self.scene_number}. Press 'q' and Enter to stop recording.")
 
-        boson_producer = FrameProducer(self.boson_camera, self.frame_queue, self.stop_event, "boson")
-        blackfly_producer = FrameProducer(self.blackfly_camera, self.frame_queue, self.stop_event, "blackfly")
-        consumer = FrameConsumer(self.frame_queue, scene_dir, self.stop_event, self.boson_camera)
+        boson_producer = FrameProducer(self.boson_camera, self.boson_queue, self.stop_event, "boson")
+        blackfly_producer = FrameProducer(self.blackfly_camera, self.blackfly_queue, self.stop_event, "blackfly")
+        consumer = FrameConsumer(self.boson_queue, self.blackfly_queue, scene_dir, self.stop_event, self.boson_camera)
 
         boson_producer.start()
         blackfly_producer.start()
         consumer.start()
 
         start_time = time.time()
-
         try:
             while not self.stop_event.is_set():
                 if time.time() - start_time > self.recording_duration:
@@ -214,9 +239,8 @@ class SceneRecorder:
             boson_producer.join()
             blackfly_producer.join()
             consumer.join()
-
-        logging.info(f"Scene {self.scene_number} completed. {consumer.frame_number} frames captured.")
-        self.scene_number = self.get_next_scene_number()
+            logging.info(f"Scene {self.scene_number} completed. {consumer.frame_number} frames captured.")
+            self.scene_number = self.get_next_scene_number()
 
     def record_scenes(self):
         signal.signal(signal.SIGINT, self.signal_handler)  # Handle Ctrl+C
