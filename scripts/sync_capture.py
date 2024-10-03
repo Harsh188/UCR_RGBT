@@ -28,6 +28,7 @@ class Camera(ABC):
 class BosonCamera(Camera):
     def __init__(self):
         self.camera = Boson()
+        self.camera.set_external_sync_mode(1)  # Set external sync mode
 
     def capture_frame(self):
         frame = self.camera.grab()
@@ -52,7 +53,10 @@ class BlackflyCamera(Camera):
         self.camera.PixelFormat.SetValue(PySpin.PixelFormat_BGR8)
         self.camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
         self.set_optimal_frame_rate()
+        self.set_buffer_handling_mode()
         self.camera.BeginAcquisition()
+        self.processor = PySpin.ImageProcessor()
+        self.processor.SetColorProcessing(PySpin.SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR)
 
     def set_optimal_frame_rate(self):
         try:
@@ -64,13 +68,20 @@ class BlackflyCamera(Camera):
             logging.warning(f"Unable to set frame rate: {e}")
             logging.info("Continuing with default frame rate")
 
+    def set_buffer_handling_mode(self):
+        sNodemap = self.camera.GetTLStreamNodeMap()
+        node_bufferhandling_mode = PySpin.CEnumerationPtr(sNodemap.GetNode('StreamBufferHandlingMode'))
+        node_newestonly = node_bufferhandling_mode.GetEntryByName('NewestOnly')
+        node_newestonly_mode = node_newestonly.GetValue()
+        node_bufferhandling_mode.SetIntValue(node_newestonly_mode)
+
     def capture_frame(self):
         image_result = self.camera.GetNextImage()
         if image_result.IsIncomplete():
             logging.warning(f"Blackfly image incomplete with image status {image_result.GetImageStatus()}")
             image_result.Release()
             return None
-        frame = image_result.GetNDArray()
+        frame = self.processor.Convert(image_result, PySpin.PixelFormat_BGR8).GetNDArray()
         image_result.Release()
         return frame
 
@@ -97,8 +108,9 @@ class FrameProducer(threading.Thread):
             while not self.stop_event.is_set():
                 frame = self.camera.capture_frame()
                 if frame is not None:
-                    self.frame_queue.put(frame)
-                    frames_processed += 1
+                    if self.frame_queue.qsize() < 100:  # Drop frames if queue is too full
+                        self.frame_queue.put(frame)
+                        frames_processed += 1
                     current_time = time.time()
                     if current_time - last_log_time >= 5:  # Log every 5 seconds
                         elapsed_time = current_time - last_log_time
@@ -112,46 +124,40 @@ class FrameProducer(threading.Thread):
             self.stop_event.set()  # Signal the consumer to stop
 
 class FrameConsumer(threading.Thread):
-    def __init__(self, boson_queue, blackfly_queue, scene_dir, stop_event, boson_camera):
+    def __init__(self, rgb_queue, lwir_queue, scene_dir, stop_event, boson_camera):
         super().__init__()
-        self.boson_queue = boson_queue
-        self.blackfly_queue = blackfly_queue
+        self.rgb_queue = rgb_queue
+        self.lwir_queue = lwir_queue
         self.scene_dir = scene_dir
         self.stop_event = stop_event
         self.frame_number = 0
         self.boson_camera = boson_camera
-        self.buffer = {'boson': None, 'blackfly': None}
 
     def run(self):
         try:
-            while not self.stop_event.is_set() or not self.boson_queue.empty() or not self.blackfly_queue.empty():
+            while not self.stop_event.is_set() or not self.rgb_queue.empty() or not self.lwir_queue.empty():
                 try:
-                    if self.buffer['boson'] is None:
-                        self.buffer['boson'] = self.boson_queue.get(timeout=0.1)
-                    if self.buffer['blackfly'] is None:
-                        self.buffer['blackfly'] = self.blackfly_queue.get(timeout=0.1)
-                    
-                    if self.buffer['boson'] is not None and self.buffer['blackfly'] is not None:
-                        self.process_frame_pair()
-                        self.buffer = {'boson': None, 'blackfly': None}
-                        self.frame_number += 1
+                    rgb_frame = self.rgb_queue.get(timeout=0.1)
+                    lwir_frame = self.lwir_queue.get(timeout=0.1)
+                    self.process_frame_pair(rgb_frame, lwir_frame)
+                    self.frame_number += 1
                 except queue.Empty:
                     continue
         except Exception as e:
             logging.error(f"FrameConsumer encountered an error: {e}", exc_info=True)
             self.stop_event.set()  # Signal to stop
 
-    def process_frame_pair(self):
+    def process_frame_pair(self, rgb_frame, lwir_frame):
         timestamp = datetime.now()
-        # Process Boson frame
-        self.save_frame(self.buffer['boson'], os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
-        boson_agc_rgb = self.boson_camera.get_agc_frame(self.buffer['boson'])
-        self.save_frame(boson_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
-        self.save_meta(self.calculate_meta(self.buffer['boson']), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
-        self.save_meta(self.calculate_meta(boson_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
-        # Process Blackfly frame
-        self.save_frame(self.buffer['blackfly'], os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
-        self.save_meta(self.calculate_meta(self.buffer['blackfly']), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
+        # Process LWIR frame
+        self.save_frame(lwir_frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp)
+        lwir_agc_rgb = self.boson_camera.get_agc_frame(lwir_frame)
+        self.save_frame(lwir_agc_rgb, os.path.join(self.scene_dir, "lwir", "agc", "data"), "LWIR_AGC", timestamp)
+        self.save_meta(self.calculate_meta(lwir_frame), os.path.join(self.scene_dir, "lwir", "raw", "meta"), timestamp)
+        self.save_meta(self.calculate_meta(lwir_agc_rgb), os.path.join(self.scene_dir, "lwir", "agc", "meta"), timestamp)
+        # Process RGB frame
+        self.save_frame(rgb_frame, os.path.join(self.scene_dir, "rgb", "data"), "RGB", timestamp)
+        self.save_meta(self.calculate_meta(rgb_frame), os.path.join(self.scene_dir, "rgb", "meta"), timestamp)
 
     def save_frame(self, frame, directory, prefix, timestamp):
         os.makedirs(directory, exist_ok=True)
@@ -179,8 +185,8 @@ class SceneRecorder:
         self.boson_camera = BosonCamera()
         self.blackfly_camera = BlackflyCamera()
         self.scene_number = self.get_next_scene_number()
-        self.boson_queue = queue.Queue(maxsize=1000)
-        self.blackfly_queue = queue.Queue(maxsize=1000)
+        self.rgb_queue = queue.Queue(maxsize=128)
+        self.lwir_queue = queue.Queue(maxsize=256)
         self.stop_event = threading.Event()
         self.recording_duration = recording_duration
 
@@ -215,12 +221,12 @@ class SceneRecorder:
         scene_dir = self.create_directory_structure()
         logging.info(f"Recording scene {self.scene_number}. Press 'q' and Enter to stop recording.")
 
-        boson_producer = FrameProducer(self.boson_camera, self.boson_queue, self.stop_event, "boson")
-        blackfly_producer = FrameProducer(self.blackfly_camera, self.blackfly_queue, self.stop_event, "blackfly")
-        consumer = FrameConsumer(self.boson_queue, self.blackfly_queue, scene_dir, self.stop_event, self.boson_camera)
+        rgb_producer = FrameProducer(self.blackfly_camera, self.rgb_queue, self.stop_event, "rgb")
+        lwir_producer = FrameProducer(self.boson_camera, self.lwir_queue, self.stop_event, "lwir")
+        consumer = FrameConsumer(self.rgb_queue, self.lwir_queue, scene_dir, self.stop_event, self.boson_camera)
 
-        boson_producer.start()
-        blackfly_producer.start()
+        rgb_producer.start()
+        lwir_producer.start()
         consumer.start()
 
         start_time = time.time()
@@ -236,8 +242,8 @@ class SceneRecorder:
             logging.info("Keyboard interrupt received.")
         finally:
             self.stop_event.set()
-            boson_producer.join()
-            blackfly_producer.join()
+            rgb_producer.join()
+            lwir_producer.join()
             consumer.join()
             logging.info(f"Scene {self.scene_number} completed. {consumer.frame_number} frames captured.")
             self.scene_number = self.get_next_scene_number()
