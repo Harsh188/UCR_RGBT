@@ -14,9 +14,29 @@ import logging
 import time
 import asyncio
 import aiofiles
+import psutil
 
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# New class for monitoring system resources
+class SystemMonitor:
+    def __init__(self, interval=5):
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._monitor, daemon=True)
+        self.thread.start()
+
+    def _monitor(self):
+        while not self.stop_event.is_set():
+            cpu_usage = psutil.cpu_percent(interval=1)
+            memory_usage = psutil.virtual_memory().percent
+            logging.info(f"CPU Usage: {cpu_usage}% | Memory Usage: {memory_usage}%")
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
 
 class Camera(ABC):
     @abstractmethod
@@ -136,11 +156,11 @@ class FrameProducer(threading.Thread):
             while not self.stop_event.is_set():
                 frame = self.camera.capture_frame()
                 if frame is not None:
-                    if self.frame_queue.qsize() < 100: # Drop frames if queue is too full
+                    if self.frame_queue.qsize() < 100:  # Drop frames if queue is too full
                         self.frame_queue.put(frame)
                     frames_processed += 1
                     current_time = time.time()
-                    if current_time - last_log_time >= 5: # Log every 5 seconds
+                    if current_time - last_log_time >= 5:  # Log every 5 seconds
                         elapsed_time = current_time - last_log_time
                         fps = frames_processed / elapsed_time
                         logging.info(f"{self.camera_type} frame rate: {fps:.2f} FPS")
@@ -149,7 +169,7 @@ class FrameProducer(threading.Thread):
                         frames_processed = 0
         except Exception as e:
             logging.error(f"FrameProducer encountered an error: {e}", exc_info=True)
-            self.stop_event.set() # Signal the consumer to stop
+            self.stop_event.set()  # Signal the consumer to stop
 
 class FrameConsumer(threading.Thread):
     def __init__(self, rgb_queue, lwir_queue, scene_dir, stop_event, boson_camera):
@@ -223,10 +243,12 @@ class SceneRecorder:
         self.lwir_queue = queue.Queue(maxsize=256)
         self.stop_event = threading.Event()
         self.recording_duration = recording_duration
+        self.system_monitor = SystemMonitor()  # Initialize the system monitor
 
     def signal_handler(self, signum, frame):
         logging.info('Received termination signal. Exiting...')
-        self.stop_event.set() # Signal threads to stop
+        self.stop_event.set()  # Signal threads to stop
+        self.system_monitor.stop()  # Stop the system monitor
 
     def get_next_scene_number(self):
         scene_number = 1
@@ -283,7 +305,7 @@ class SceneRecorder:
             self.scene_number = self.get_next_scene_number()
 
     def record_scenes(self):
-        signal.signal(signal.SIGINT, self.signal_handler) # Handle Ctrl+C
+        signal.signal(signal.SIGINT, self.signal_handler)  # Handle Ctrl+C
         try:
             while True:
                 self.record_scene()
@@ -292,6 +314,7 @@ class SceneRecorder:
                     break
         finally:
             self.close_cameras()
+            self.system_monitor.stop()  # Stop the system monitor
 
     def close_cameras(self):
         logging.info("Closing cameras and cleaning up resources.")
