@@ -236,7 +236,7 @@ class SceneRecorder:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Scene Recorder for Boson and Blackfly cameras")
-    parser.add_argument("--base_dir", type=str, default="UCRT", help="Base directory for saving scenes")
+    parser.add_argument("--base_dir", type=str, default=r"C:\Users\EndUser\Documents\Programming\BosonChecks\UCR_RGBT\dataset\UCRT", help="Base directory for saving scenes")
     parser.add_argument("--duration", type=int, default=10, help="Recording duration for each scene in seconds")
     return parser.parse_args()
 
