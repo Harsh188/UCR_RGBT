@@ -123,9 +123,18 @@ class BlackflyCamera(Camera):
                 continue
             frame = self.processor.Convert(image_result, PySpin.PixelFormat_BGR8).GetNDArray()
             image_result.Release()
+            
+            # Reduce resolution by 50%
+            reduced_frame = self.reduce_resolution(frame)
+            
             if self.frame_buffer.full():
                 self.frame_buffer.get() # Remove oldest frame if buffer is full
-            self.frame_buffer.put(frame)
+            self.frame_buffer.put(reduced_frame)
+
+    def reduce_resolution(self, frame):
+        height, width = frame.shape[:2]
+        new_height, new_width = height // 2, width // 2
+        return cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
     def capture_frame(self):
         try:
@@ -156,11 +165,11 @@ class FrameProducer(threading.Thread):
             while not self.stop_event.is_set():
                 frame = self.camera.capture_frame()
                 if frame is not None:
-                    if self.frame_queue.qsize() < 100:  # Drop frames if queue is too full
+                    if self.frame_queue.qsize() < 450:  # Drop frames if queue is too full
                         self.frame_queue.put(frame)
                     frames_processed += 1
                     current_time = time.time()
-                    if current_time - last_log_time >= 5:  # Log every 5 seconds
+                    if current_time - last_log_time >= 2:  # Log every 5 seconds
                         elapsed_time = current_time - last_log_time
                         fps = frames_processed / elapsed_time
                         logging.info(f"{self.camera_type} frame rate: {fps:.2f} FPS")
@@ -239,8 +248,8 @@ class SceneRecorder:
         self.boson_camera = BosonCamera()
         self.blackfly_camera = BlackflyCamera()
         self.scene_number = self.get_next_scene_number()
-        self.rgb_queue = queue.Queue(maxsize=128)
-        self.lwir_queue = queue.Queue(maxsize=256)
+        self.rgb_queue = queue.Queue(maxsize=500)
+        self.lwir_queue = queue.Queue(maxsize=500)
         self.stop_event = threading.Event()
         self.recording_duration = recording_duration
         self.system_monitor = SystemMonitor()  # Initialize the system monitor
