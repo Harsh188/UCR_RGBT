@@ -70,9 +70,11 @@ class BosonCamera(Camera):
         while not self.stop_event.is_set():
             frame = self.camera.grab()
             if frame is not None:
+                # Flip the frame vertically (across the horizontal axis)
+                flipped_frame = cv2.flip(frame, 1)
                 if self.frame_buffer.full():
                     self.frame_buffer.get() # Remove oldest frame if buffer is full
-                self.frame_buffer.put(frame)
+                self.frame_buffer.put(flipped_frame)
             else:
                 logging.warning("Failed to capture Boson frame")
 
