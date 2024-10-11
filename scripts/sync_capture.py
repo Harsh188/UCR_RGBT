@@ -1,3 +1,19 @@
+"""
+This script implements a multi-threaded scene recorder for simultaneous capture from Boson (LWIR) and Blackfly (RGB) cameras.
+It uses separate threads for frame production and consumption, allowing for efficient capture and storage of synchronized
+RGB and LWIR image pairs. The script also includes features for system resource monitoring, automatic scene numbering,
+and structured data storage. It's designed for creating datasets of aligned RGB-LWIR image pairs, useful for various
+computer vision and thermal imaging applications.
+
+Key features:
+- Simultaneous capture from Boson (LWIR) and Blackfly (RGB) cameras
+- Multi-threaded frame production and consumption for efficient processing
+- Automatic scene numbering and structured data storage
+- System resource monitoring
+- Configurable recording duration and base directory
+- Graceful termination handling
+"""
+
 import cv2
 import numpy as np
 import os
@@ -20,17 +36,18 @@ import pdb
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Camera settings and constants
 EXPOSURE_TIME = 10000 # in microseconds
-GAIN_VALUE = 0 #in dB, 0-40;
+GAIN_VALUE = 0 #in dB, 0-40
 GAMMA_VALUE = 0.5 #0.25-1
-SEC_TO_RECORD = 10 #approximate # seconds to record for; can also use Ctrl-C to interupt in middle of capture
+SEC_TO_RECORD = 10 #approximate # seconds to record for; can also use Ctrl-C to interrupt in middle of capture
 IMAGE_HEIGHT = 540  #540 pixels default
 IMAGE_WIDTH = 720 #720 pixels default
 HEIGHT_OFFSET = round((IMAGE_HEIGHT)/2) # Y, to keep in middle of sensor
 WIDTH_OFFSET = round((IMAGE_WIDTH)/2) # X, to keep in middle of sensor
 
-# New class for monitoring system resources
 class SystemMonitor:
+    """Monitors system resources (CPU and memory usage) in a separate thread."""
     def __init__(self, interval=5):
         self.interval = interval
         self.stop_event = threading.Event()
@@ -49,6 +66,7 @@ class SystemMonitor:
         self.thread.join()
 
 class Camera(ABC):
+    """Abstract base class for camera interfaces."""
     @abstractmethod
     def capture_frame(self):
         pass
@@ -58,6 +76,7 @@ class Camera(ABC):
         pass
 
 class BosonCamera(Camera):
+    """Interface for the Boson LWIR camera."""
     def __init__(self):
         self.camera = Boson()
         self.camera.set_external_sync_mode(1) # Set external sync mode
@@ -85,6 +104,7 @@ class BosonCamera(Camera):
             return None
 
     def get_agc_frame(self, frame):
+        """Apply Automatic Gain Control to the frame."""
         agc = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         return cv2.cvtColor(agc, cv2.COLOR_GRAY2RGB)
 
@@ -94,8 +114,9 @@ class BosonCamera(Camera):
         self.camera.close()
 
 class BlackflyCamera(Camera):
+    """Interface for the Blackfly RGB camera."""
     def __init__(self):
-        
+        # Initialize the camera and set its properties
         self.system = PySpin.System.GetInstance()
         self.cam_list = self.system.GetCameras()
         self.camera = self.cam_list[0]
@@ -103,18 +124,9 @@ class BlackflyCamera(Camera):
         self.camera.UserSetSelector.SetValue(PySpin.UserSetSelector_Default)
         self.camera.UserSetLoad()
         self.camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
-        # self.camera.ExposureAuto.SetValue(PySpin.ExposureAuto_On)
-        # self.camera.ExposureTime.SetValue(EXPOSURE_TIME)
-        # self.camera.AcquisitionFrameRateEnable.SetValue(False)
-        # self.camera.GainAuto.SetValue(PySpin.GainAuto_Off)
-        # self.camera.Gain.SetValue(GAIN_VALUE)
-        # self.camera.GammaEnable.SetValue(True)
         self.camera.PixelFormat.SetValue(PySpin.PixelFormat_BayerRG8)
-        # self.camera.Width.SetValue(IMAGE_WIDTH)
-        # self.camera.Height.SetValue(IMAGE_HEIGHT)
-        # self.camera.OffsetX.SetValue(WIDTH_OFFSET)
-        # self.camera.OffsetY.SetValue(HEIGHT_OFFSET)
 
+        # Set up camera transfer layer and line properties
         camTransferLayerStream = self.camera.GetTLStreamNodeMap()
         handling_mode1 = PySpin.CEnumerationPtr(camTransferLayerStream.GetNode('StreamBufferHandlingMode'))
         handling_mode_entry = handling_mode1.GetEntryByName('OldestFirst')
@@ -122,77 +134,20 @@ class BlackflyCamera(Camera):
         self.camera.LineSelector.SetValue(PySpin.LineSelector_Line1)
         self.camera.LineMode.SetValue(PySpin.LineMode_Output) 
         self.camera.LineSource.SetValue(PySpin.LineSource_ExposureActive)
-        
 
-        # self.set_camera_resolution()
-        # self.set_optimal_frame_rate()
-        # self.optimize_camera_settings()
+        # Print frame rate information
         frameRate = self.camera.AcquisitionResultingFrameRate()
         print('frame rate = {:.2f} FPS'.format(frameRate))
         numImages = round(frameRate*SEC_TO_RECORD)
         print('# frames = {:d}'.format(numImages))
 
-        # self.set_buffer_handling_mode()
+        # Start acquisition and set up image processing
         self.camera.BeginAcquisition()
         self.processor = PySpin.ImageProcessor()
-        # self.processor.SetColorProcessing(PySpin.HQ_LINEAR) # EXPERIMENTAL
         self.processor.SetColorProcessing(PySpin.SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR)
         self.frame_buffer = queue.Queue(maxsize=500)
         self.capture_thread = threading.Thread(target=self._capture_frames, daemon=True)
         self.capture_thread.start()
-    
-    def optimize_camera_settings(self):
-        self.camera.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
-        self.camera.ExposureTime.SetValue(1000)  # exposure time, adjust as needed
-
-        # Optimize packet size for GigE cameras (adjust for USB3 if needed)
-        self.camera.GevSCPSPacketSize.SetValue(9000)
-        self.camera.GevSCPD.SetValue(0)  # Set packet delay to 0
-
-        logging.info("Camera settings optimized for higher frame rate")
-
-    def set_optimal_frame_rate(self):
-        try:
-            max_frame_rate = self.camera.AcquisitionFrameRate.GetMax()
-            self.camera.AcquisitionFrameRateEnable.SetValue(True)
-            # pdb.set_trace()
-            self.camera.AcquisitionFrameRate.SetValue(max_frame_rate)
-            logging.info(f"Frame rate set to {max_frame_rate:.2f} fps")
-        except PySpin.SpinnakerException as e:
-            logging.warning(f"Unable to set frame rate: {e}")
-            logging.info("Continuing with default frame rate")
-
-    def set_buffer_handling_mode(self):
-        sNodemap = self.camera.GetTLStreamNodeMap()
-        node_bufferhandling_mode = PySpin.CEnumerationPtr(sNodemap.GetNode('StreamBufferHandlingMode'))
-        node_newestonly = node_bufferhandling_mode.GetEntryByName('NewestOnly')
-        node_newestonly_mode = node_newestonly.GetValue()
-        node_bufferhandling_mode.SetIntValue(node_newestonly_mode)
-    
-    def set_camera_resolution(self):
-        # Get the maximum width and height
-        max_width = self.camera.WidthMax.GetValue()
-        max_height = self.camera.HeightMax.GetValue()
-        
-        # Set the desired resolution (e.g., half of the maximum)
-        desired_width = max_width // 2
-        desired_height = max_height // 2
-        
-        # Ensure the desired dimensions are multiples of 4
-        desired_width = desired_width - (desired_width % 4)
-        desired_height = desired_height - (desired_height % 4)
-        
-        # Set the new width and height
-        self.camera.Width.SetValue(desired_width)
-        self.camera.Height.SetValue(desired_height)
-        
-        # Center the ROI
-        offset_x = (max_width - desired_width) // 2
-        offset_y = (max_height - desired_height) // 2
-        self.camera.OffsetX.SetValue(offset_x)
-        self.camera.OffsetY.SetValue(offset_y)
-        
-        logging.info(f"Camera resolution set to {desired_width}x{desired_height}")
 
     def _capture_frames(self):
         while True:
@@ -204,17 +159,11 @@ class BlackflyCamera(Camera):
             bayer_image = image_result.GetNDArray()
             frame = cv2.cvtColor(bayer_image, cv2.COLOR_BayerRG2RGB)
 
-            # pdb.set_trace()
             image_result.Release()
             
             if self.frame_buffer.full():
                 self.frame_buffer.get() # Remove oldest frame if buffer is full
             self.frame_buffer.put(frame)
-
-    def reduce_resolution(self, frame):
-        height, width = frame.shape[:2]
-        new_height, new_width = height // 2, width // 2
-        return cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
     def capture_frame(self):
         try:
@@ -230,6 +179,7 @@ class BlackflyCamera(Camera):
         self.system.ReleaseInstance()
 
 class FrameProducer(threading.Thread):
+    """Thread class for capturing frames from a camera and putting them into a queue."""
     def __init__(self, camera, frame_queue, stop_event, camera_type):
         super().__init__()
         self.camera = camera
@@ -249,7 +199,7 @@ class FrameProducer(threading.Thread):
                         self.frame_queue.put(frame)
                     frames_processed += 1
                     current_time = time.time()
-                    if current_time - last_log_time >= 2:  # Log every 5 seconds
+                    if current_time - last_log_time >= 2:  # Log every 2 seconds
                         elapsed_time = current_time - last_log_time
                         fps = frames_processed / elapsed_time
                         logging.info(f"{self.camera_type} frame rate: {fps:.2f} FPS")
@@ -261,6 +211,7 @@ class FrameProducer(threading.Thread):
             self.stop_event.set()  # Signal the consumer to stop
 
 class FrameConsumer(threading.Thread):
+    """Thread class for processing and saving frame pairs from the queues."""
     def __init__(self, rgb_queue, lwir_queue, scene_dir, stop_event, boson_camera):
         super().__init__()
         self.rgb_queue = rgb_queue
@@ -289,6 +240,7 @@ class FrameConsumer(threading.Thread):
             self.loop.close()
 
     async def process_frame_pair(self, rgb_frame, lwir_frame):
+        """Process and save a pair of RGB and LWIR frames."""
         timestamp = datetime.now()
         tasks = [
             self.save_frame(lwir_frame, os.path.join(self.scene_dir, "lwir", "raw", "data"), "LWIR_RAW", timestamp),
@@ -301,6 +253,7 @@ class FrameConsumer(threading.Thread):
         await asyncio.gather(*tasks)
 
     async def save_frame(self, frame, directory, prefix, timestamp):
+        """Save a frame as an image file."""
         os.makedirs(directory, exist_ok=True)
         filename = f"{prefix}_{self.frame_number:06d}_{timestamp.strftime('%H_%M_%S_%f')[:-3]}.png"
         _, img_encoded = cv2.imencode('.png', frame)
@@ -308,12 +261,14 @@ class FrameConsumer(threading.Thread):
             await f.write(img_encoded.tobytes())
 
     async def save_meta(self, meta, directory, timestamp):
+        """Save metadata as a JSON file."""
         os.makedirs(directory, exist_ok=True)
         filename = f"meta_{self.frame_number:06d}_{timestamp.strftime('%H_%M_%S_%f')[:-3]}.json"
         async with aiofiles.open(os.path.join(directory, filename), mode='w') as f:
             await f.write(json.dumps(meta))
 
     def calculate_meta(self, frame):
+        """Calculate metadata for a frame."""
         return {
             "timestamp": datetime.now().isoformat(),
             "frame_number": self.frame_number,
@@ -323,6 +278,7 @@ class FrameConsumer(threading.Thread):
         }
 
 class SceneRecorder:
+    """Main class for recording scenes from both cameras."""
     def __init__(self, base_dir, recording_duration=10):
         self.base_dir = base_dir
         self.boson_camera = BosonCamera()
@@ -335,17 +291,20 @@ class SceneRecorder:
         self.system_monitor = SystemMonitor()  # Initialize the system monitor
 
     def signal_handler(self, signum, frame):
+        """Handle termination signals."""
         logging.info('Received termination signal. Exiting...')
         self.stop_event.set()  # Signal threads to stop
         self.system_monitor.stop()  # Stop the system monitor
 
     def get_next_scene_number(self):
+        """Determine the next available scene number."""
         scene_number = 1
         while os.path.exists(os.path.join(self.base_dir, f'scene_{scene_number}')):
             scene_number += 1
         return scene_number
 
     def create_directory_structure(self):
+        """Create the directory structure for storing scene data."""
         scene_dir = os.path.join(self.base_dir, f"scene_{self.scene_number}")
         directories = [
             os.path.join(scene_dir, "lwir", "agc", subdir)
@@ -362,79 +321,6 @@ class SceneRecorder:
         return scene_dir
 
     def record_scene(self):
+        """Record a single scene."""
         self.stop_event.clear()
-        scene_dir = self.create_directory_structure()
-        logging.info(f"Recording scene {self.scene_number}. Press 'q' and Enter to stop recording.")
-
-        rgb_producer = FrameProducer(self.blackfly_camera, self.rgb_queue, self.stop_event, "rgb")
-        lwir_producer = FrameProducer(self.boson_camera, self.lwir_queue, self.stop_event, "lwir")
-        consumer = FrameConsumer(self.rgb_queue, self.lwir_queue, scene_dir, self.stop_event, self.boson_camera)
-
-        rgb_producer.start()
-        lwir_producer.start()
-        consumer.start()
-
-        start_time = time.time()
-        try:
-            while not self.stop_event.is_set():
-                if time.time() - start_time > self.recording_duration:
-                    logging.info(f"Recording duration of {self.recording_duration} seconds reached.")
-                    break
-                if input().lower() == 'q':
-                    logging.info("User requested stop.")
-                    break
-        except KeyboardInterrupt:
-            logging.info("Keyboard interrupt received.")
-        finally:
-            self.stop_event.set()
-            # Clear the queues
-            while not self.rgb_queue.empty():
-                self.rgb_queue.get()
-            while not self.lwir_queue.empty():
-                self.lwir_queue.get()
-            
-            # Join threads with a timeout
-            rgb_producer.join(timeout=5)
-            lwir_producer.join(timeout=5)
-            consumer.join(timeout=5)
-            
-            if rgb_producer.is_alive() or lwir_producer.is_alive() or consumer.is_alive():
-                logging.warning("Some threads did not terminate properly.")
-            
-            logging.info(f"Scene {self.scene_number} completed. {consumer.frame_number} frames captured.")
-            self.scene_number = self.get_next_scene_number()
-
-    def record_scenes(self):
-        signal.signal(signal.SIGINT, self.signal_handler)  # Handle Ctrl+C
-        try:
-            while True:
-                self.record_scene()
-                user_input = input("Press Enter to record another scene or 'q' to quit: ")
-                if user_input.lower() == 'q':
-                    break
-        finally:
-            self.close_cameras()
-            self.system_monitor.stop()  # Stop the system monitor
-
-    def close_cameras(self):
-        logging.info("Closing cameras and cleaning up resources.")
-        self.boson_camera.close()
-        self.blackfly_camera.close()
-        self.system_monitor.stop()
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Scene Recorder for Boson and Blackfly cameras")
-    parser.add_argument("--base_dir", type=str, default=r"C:\Users\EndUser\Documents\Programming\BosonChecks\UCR_RGBT\dataset\UCRT", help="Base directory for saving scenes")
-    parser.add_argument("--duration", type=int, default=10, help="Recording duration for each scene in seconds")
-    return parser.parse_args()
-
-def main():
-    args = parse_arguments()
-    base_dir = args.base_dir
-    recording_duration = args.duration
-    os.makedirs(base_dir, exist_ok=True)
-    recorder = SceneRecorder(base_dir, recording_duration)
-    recorder.record_scenes()
-
-if __name__ == "__main__":
-    main()
+        scene_dir = self.create_directory
