@@ -23,8 +23,8 @@ class BlackflyCamera(Camera):
         self.cam_list = self.system.GetCameras()
         self.camera = self.cam_list[0]
         self.camera.Init()
-        self.camera.UserSetSelector.SetValue(PySpin.UserSetSelector_Default)
-        self.camera.UserSetLoad()
+        # self.camera.UserSetSelector.SetValue(PySpin.UserSetSelector_Default)
+        # self.camera.UserSetLoad()
         self.camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
         # self.camera.ExposureAuto.SetValue(PySpin.ExposureAuto_On)
         # self.camera.ExposureTime.SetValue(EXPOSURE_TIME)
@@ -38,16 +38,16 @@ class BlackflyCamera(Camera):
         # self.camera.OffsetX.SetValue(WIDTH_OFFSET)
         # self.camera.OffsetY.SetValue(HEIGHT_OFFSET)
 
-        camTransferLayerStream = self.camera.GetTLStreamNodeMap()
-        handling_mode1 = PySpin.CEnumerationPtr(camTransferLayerStream.GetNode('StreamBufferHandlingMode'))
-        handling_mode_entry = handling_mode1.GetEntryByName('OldestFirst')
-        handling_mode1.SetIntValue(handling_mode_entry.GetValue())
-        self.camera.LineSelector.SetValue(PySpin.LineSelector_Line1)
-        self.camera.LineMode.SetValue(PySpin.LineMode_Output) 
-        self.camera.LineSource.SetValue(PySpin.LineSource_ExposureActive)
+        # camTransferLayerStream = self.camera.GetTLStreamNodeMap()
+        # handling_mode1 = PySpin.CEnumerationPtr(camTransferLayerStream.GetNode('StreamBufferHandlingMode'))
+        # handling_mode_entry = handling_mode1.GetEntryByName('OldestFirst')
+        # handling_mode1.SetIntValue(handling_mode_entry.GetValue())
+        # self.camera.LineSelector.SetValue(PySpin.LineSelector_Line1)
+        # self.camera.LineMode.SetValue(PySpin.LineMode_Output) 
+        # self.camera.LineSource.SetValue(PySpin.LineSource_ExposureActive)
 
-        # if not self.set_external_sync_mode():
-        #     raise Exception("Unable to set syncronization.")
+        if not self.set_external_sync_mode():
+            raise Exception("Unable to set syncronization.")
         
         # self.set_optimal_frame_rate()
         # self.optimize_camera_settings()
@@ -83,15 +83,18 @@ class BlackflyCamera(Camera):
             
             # Set triger mode to "Off"
             self.camera.TriggerMode.SetValue(PySpin.TriggerMode_Off)
-
-            # Set trigger source to Line3 (adjust if using a different input line)
-            self.camera.TriggerSource.SetValue(PySpin.TriggerSource_Line0)
-
-            # Set trigger overlap to ReadOut for better performance
-            self.camera.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
             
-            # Enable trigger mode
-            self.camera.TriggerMode.SetValue(PySpin.TriggerMode_On)
+            # Set trigger selector to frame start
+            # self.camera.TriggerSource.SetValue(PySpin.TriggerSelector_FrameStart)
+
+            # # Set trigger source to Line0 (adjust if using a different input line)
+            # self.camera.TriggerSource.SetValue(PySpin.TriggerSource_Line3)
+
+            # # Set trigger overlap to ReadOut for better performance
+            # self.camera.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
+            
+            # # Enable trigger mode
+            # self.camera.TriggerMode.SetValue(PySpin.TriggerMode_On)
             return True
         
         except PySpin.SpinnakerException as ex:
@@ -153,15 +156,17 @@ class BlackflyCamera(Camera):
 
     def _capture_frames(self):
         while True:
-            image_result = self.camera.GetNextImage()
+            image_result = self.camera.GetNextImage(1000)
+
             if image_result.IsIncomplete():
+                print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
                 image_result.Release()
                 continue
             
             bayer_image = image_result.GetNDArray()
             frame = cv2.cvtColor(bayer_image, cv2.COLOR_BayerRG2RGB)
 
-            # pdb.set_trace()
+            # Release Image
             image_result.Release()
             
             if self.frame_buffer.full():

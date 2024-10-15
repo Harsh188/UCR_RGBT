@@ -12,8 +12,6 @@ import numpy as np
 import os
 import json
 from datetime import datetime
-from abc import ABC, abstractmethod
-from flirpy.camera.boson import Boson
 import argparse
 import threading
 import queue
@@ -109,7 +107,7 @@ class FrameConsumer(threading.Thread):
                     continue
         except Exception as e:
             logging.error(f"FrameConsumer encountered an error: {e}", exc_info=True)
-            self.stop_event.set() # Signal to stop
+            self.stop_event.set()
         finally:
             self.loop.close()
 
@@ -128,11 +126,14 @@ class FrameConsumer(threading.Thread):
     async def save_frame(self, frame, directory, prefix, timestamp):
         os.makedirs(directory, exist_ok=True)
         filename = f"{prefix}_{self.frame_number:06d}_{timestamp.strftime('%H_%M_%S_%f')[:-3]}.png"
-        print(prefix, frame.shape)
-        _, img_encoded = cv2.imencode('.png', frame)
-
-        async with aiofiles.open(os.path.join(directory, filename), mode='wb') as f:
-            await f.write(img_encoded.tobytes())
+        filepath = os.path.join(directory, filename)
+        
+        # Ensure LWIR_RAW is saved as 16-bit
+        if prefix == "LWIR_RAW":
+            frame = frame.astype(np.uint16)
+        
+        # Use asyncio to run cv2.imwrite in a separate thread
+        await asyncio.get_event_loop().run_in_executor(None, cv2.imwrite, filepath, frame)
 
     async def save_meta(self, meta, directory, timestamp):
         os.makedirs(directory, exist_ok=True)
